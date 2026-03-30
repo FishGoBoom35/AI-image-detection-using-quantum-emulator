@@ -1,177 +1,299 @@
-"""
-Improved hybrid quantum-classical AI image classifier using qsimcirq
-
-Changes from the earlier version:
-1. Uses 6 PCA features instead of 4
-2. Uses a deeper 6-qubit circuit
-3. Extracts quantum features from qsimcirq
-4. Uses Logistic Regression on the quantum features instead of nearest-centroid
-
-This is still a hybrid model:
-- classical preprocessing
-- quantum-emulated feature extraction
-- classical final classifier
-"""
-
 import os
-import cv2
 import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from PIL import Image
+ 
+from sklearn.linear_model import LogisticRegression
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, classification_report
+from sklearn.model_selection import cross_val_score
+ 
 import cirq
 import qsimcirq
-
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-
-
+ 
 # -----------------------------
-# File paths
+# CONFIG
 # -----------------------------
-base_dir = os.path.dirname(os.path.abspath(__file__))
-real_folder = os.path.join(base_dir, "images", "real")
-ai_folder = os.path.join(base_dir, "images", "ai")
-
-
+DATASET_PATH = "dataset"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 32
+QUBIT_SWEEP = [4, 6, 8, 10, 12]   # swept for the research question
+ 
 # -----------------------------
-# Image preprocessing
+# IMAGE TRANSFORM
 # -----------------------------
-def preprocess_image(path, size=(64, 64)):
-    img = cv2.imread(path)
-
-    if img is None:
-        raise ValueError(f"Could not load image: {path}")
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, size)
-    gray = gray.astype(np.float32) / 255.0
-    return gray
-
-
-# -----------------------------
-# Build dataset
-# -----------------------------
-data = []
-labels = []
-
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+ 
 valid_ext = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
-
-for filename in sorted(os.listdir(real_folder)):
-    if not filename.lower().endswith(valid_ext):
-        continue
-    path = os.path.join(real_folder, filename)
-    data.append(preprocess_image(path))
-    labels.append(0)
-
-for filename in sorted(os.listdir(ai_folder)):
-    if not filename.lower().endswith(valid_ext):
-        continue
-    path = os.path.join(ai_folder, filename)
-    data.append(preprocess_image(path))
-    labels.append(1)
-
-data = np.array(data)
-labels = np.array(labels)
-
-# Flatten images: (n, 32, 32) -> (n, 1024)
-X = data.reshape(len(data), -1)
-y = labels
-
-
+ 
+ 
 # -----------------------------
-# Quantum feature transformer
+# LOAD DATASET PATHS
 # -----------------------------
-class QuantumFeatureTransformer(BaseEstimator, TransformerMixin):
-    """
-    Custom sklearn transformer that:
-    - takes PCA-reduced classical features
-    - encodes them into a Cirq circuit
-    - runs the circuit on qsimcirq
-    - returns quantum-derived features
-    """
-
+def load_dataset_split(base_path, split="train"):
+    split_path = os.path.join(base_path, split)
+    X_paths, y = [], []
+    class_map = {"REAL": 0, "FAKE": 1}
+ 
+    for class_name, label in class_map.items():
+        folder = os.path.join(split_path, class_name)
+        for filename in os.listdir(folder):
+            if filename.lower().endswith(valid_ext):
+                X_paths.append(os.path.join(folder, filename))
+                y.append(label)
+ 
+    return np.array(X_paths), np.array(y)
+ 
+ 
+# -----------------------------
+# LOAD IMAGE
+# -----------------------------
+def load_image(path):
+    img = Image.open(path).convert("RGB")
+    return transform(img)
+ 
+ 
+# -----------------------------
+# CNN FEATURE EXTRACTOR (batched)
+# -----------------------------
+class CNNFeatureExtractor:
+    def __init__(self):
+        model = models.resnet18(weights="IMAGENET1K_V1")
+        self.feature_extractor = nn.Sequential(*list(model.children())[:-1])
+        self.feature_extractor = self.feature_extractor.to(DEVICE)
+        self.feature_extractor.eval()
+ 
+    def extract(self, paths, batch_size=BATCH_SIZE):
+        features = []
+ 
+        with torch.no_grad():
+            for i in range(0, len(paths), batch_size):
+                batch_paths = paths[i:i + batch_size]
+                batch = torch.stack([load_image(p) for p in batch_paths]).to(DEVICE)
+                feat = self.feature_extractor(batch)          # (B, 512, 1, 1)
+                feat = feat.view(feat.size(0), -1)            # (B, 512)
+                features.append(feat.cpu().numpy())
+ 
+                if (i // batch_size) % 5 == 0:
+                    print(f"  Extracted {min(i + batch_size, len(paths))}/{len(paths)} images...")
+ 
+        return np.concatenate(features, axis=0).astype(np.float32)
+ 
+ 
+# -----------------------------
+# PREPROCESSING PIPELINE
+# Fit on train, transform both — no leakage
+# -----------------------------
+class Preprocessor:
+    def __init__(self, n_components):
+        self.pca = PCA(n_components=n_components)
+        self.scaler = MinMaxScaler(feature_range=(-np.pi, np.pi))
+ 
+    def fit_transform(self, X):
+        X_pca = self.pca.fit_transform(X)
+        X_scaled = self.scaler.fit_transform(X_pca)
+        explained = self.pca.explained_variance_ratio_.sum()
+        print(f"  PCA({self.pca.n_components_}): {explained:.1%} variance retained")
+        return X_scaled
+ 
+    def transform(self, X):
+        return self.scaler.transform(self.pca.transform(X))
+ 
+ 
+# -----------------------------
+# QUANTUM FEATURE TRANSFORMER
+# Fixed circuit (quantum kernel / feature map)
+# -----------------------------
+class QuantumFeatureTransformer:
     def __init__(self, n_qubits=6):
         self.n_qubits = n_qubits
         self.qubits = cirq.LineQubit.range(n_qubits)
         self.simulator = qsimcirq.QSimSimulator()
-
-    def fit(self, X, y=None):
-        return self
-
-    def _quantum_features_one(self, x):
-        if len(x) != self.n_qubits:
-            raise ValueError(f"Expected {self.n_qubits} input features, got {len(x)}")
-
+ 
+    def _build_circuit(self, x):
+        """
+        Two-layer data re-uploading circuit:
+          Layer 1: RY(x) + RZ(0.5x) on each qubit
+          Entanglement: CZ chain + CZ(last, first)
+          Layer 2: RY(pi*x) re-upload
+          Entanglement: Even-pair CZ
+        Re-uploading increases expressivity of a fixed (non-trainable) map.
+        """
         circuit = cirq.Circuit()
-
-        # First encoding layer
+ 
+        # --- Layer 1: encode ---
         for i, q in enumerate(self.qubits):
             circuit.append(cirq.ry(float(x[i])).on(q))
             circuit.append(cirq.rz(float(x[i]) * 0.5).on(q))
-
-        # First entangling layer
+ 
+        # Circular entanglement
         for i in range(self.n_qubits - 1):
             circuit.append(cirq.CZ(self.qubits[i], self.qubits[i + 1]))
-
-        # Second encoding layer
-        for i, q in enumerate(self.qubits):
-            circuit.append(cirq.rx(float(x[i]) * 0.7).on(q))
-            circuit.append(cirq.ry(float(x[i]) * 0.3).on(q))
-
-        # Ring entanglement: connect last qubit back to first
         circuit.append(cirq.CZ(self.qubits[-1], self.qubits[0]))
-
-        # Simulate the circuit
+ 
+        # --- Layer 2: re-upload ---
+        for i, q in enumerate(self.qubits):
+            circuit.append(cirq.ry(float(x[i]) * np.pi).on(q))
+ 
+        # Even-pair entanglement (different structure from layer 1)
+        for i in range(0, self.n_qubits - 1, 2):
+            circuit.append(cirq.CZ(self.qubits[i], self.qubits[i + 1]))
+ 
+        return circuit
+ 
+    def _quantum_features_one(self, x):
+        circuit = self._build_circuit(x)
         result = self.simulator.simulate(circuit)
         state = result.final_state_vector
-
-        # Extract <Z> expectation values
-        features = []
         qubit_map = {q: i for i, q in enumerate(self.qubits)}
-
+ 
+        features = []
+ 
+        # Single-qubit Z expectations  →  n_qubits features
         for q in self.qubits:
             z_val = cirq.Z(q).expectation_from_state_vector(
                 state_vector=state,
                 qubit_map=qubit_map
             ).real
             features.append(z_val)
-
+ 
+        # Two-qubit ZZ correlators  →  (n_qubits - 1) features
+        # These capture entanglement structure in the feature map
+        for i in range(self.n_qubits - 1):
+            zz_op = cirq.Z(self.qubits[i]) * cirq.Z(self.qubits[i + 1])
+            zz_val = zz_op.expectation_from_state_vector(
+                state_vector=state,
+                qubit_map=qubit_map
+            ).real
+            features.append(zz_val)
+ 
         return np.array(features, dtype=np.float32)
-
+ 
     def transform(self, X):
-        return np.array([self._quantum_features_one(row) for row in X], dtype=np.float32)
-
-
+        """X must already be PCA-reduced and scaled to [-pi, pi]."""
+        assert X.shape[1] == self.n_qubits, (
+            f"Expected {self.n_qubits} features, got {X.shape[1]}. "
+            "Run Preprocessor first."
+        )
+        out = []
+        for idx, row in enumerate(X):
+            out.append(self._quantum_features_one(row))
+            if idx % 50 == 0:
+                print(f"  Quantum transform: {idx}/{len(X)}...")
+        return np.array(out, dtype=np.float32)
+ 
+ 
 # -----------------------------
-# Model pipeline
+# EVALUATION HELPER
 # -----------------------------
-model = Pipeline([
-    ("scaler", StandardScaler()),
-    ("pca", PCA(n_components=6)),
-    ("quantum_features", QuantumFeatureTransformer(n_qubits=6)),
-    ("clf", LogisticRegression(max_iter=2000))
-])
-
-
+def evaluate(name, clf, X_test, y_test):
+    preds = clf.predict(X_test)
+    proba = clf.predict_proba(X_test)[:, 1]
+ 
+    acc  = accuracy_score(y_test, preds)
+    f1   = f1_score(y_test, preds)
+    auc  = roc_auc_score(y_test, proba)
+ 
+    print(f"\n{'='*50}")
+    print(f"  {name}")
+    print(f"{'='*50}")
+    print(f"  Accuracy : {acc:.4f}")
+    print(f"  F1 Score : {f1:.4f}")
+    print(f"  ROC-AUC  : {auc:.4f}")
+    print(classification_report(y_test, preds, target_names=["REAL", "FAKE"]))
+ 
+    return {"name": name, "accuracy": acc, "f1": f1, "auc": auc}
+ 
+ 
 # -----------------------------
-# Train/test split
+# MAIN
 # -----------------------------
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.3, random_state=42, stratify=y
-)
-
-model.fit(X_train, y_train)
-predictions = model.predict(X_test)
-
-# Cross-validation
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-scores = cross_val_score(model, X, y, cv=cv)
-
-print("Cross-validation scores:", scores)
-print("Average accuracy:", scores.mean())
-print("Predictions:", predictions)
-print("Actual:     ", y_test)
-print("Accuracy:", accuracy_score(y_test, predictions))
+def main():
+    results = []
+ 
+    # ---- Load raw paths ----
+    print("\n[1/5] Loading dataset paths...")
+    X_train_paths, y_train = load_dataset_split(DATASET_PATH, "train")
+    X_test_paths,  y_test  = load_dataset_split(DATASET_PATH, "test")
+    print(f"  Train: {len(X_train_paths)} | Test: {len(X_test_paths)}")
+    print(f"  Class balance (train) — REAL: {(y_train==0).sum()} | FAKE: {(y_train==1).sum()}")
+ 
+    # ---- CNN features ----
+    print("\n[2/5] Extracting CNN (ResNet18) features...")
+    extractor = CNNFeatureExtractor()
+    X_train_cnn = extractor.extract(X_train_paths)
+    X_test_cnn  = extractor.extract(X_test_paths)
+    print(f"  Feature shape: {X_train_cnn.shape}")
+ 
+    # ---- Condition A: Full baseline (512-dim) ----
+    print("\n[3/5] Condition A — Baseline (full 512-dim ResNet features)...")
+    clf_full = LogisticRegression(max_iter=2000)
+    clf_full.fit(X_train_cnn, y_train)
+    results.append(evaluate("Baseline (512-dim ResNet)", clf_full, X_test_cnn, y_test))
+ 
+    # ---- Sweep qubit counts ----
+    print(f"\n[4/5] Sweeping n_qubits = {QUBIT_SWEEP}...")
+ 
+    for n_qubits in QUBIT_SWEEP:
+        print(f"\n--- n_qubits = {n_qubits} ---")
+ 
+        # Shared preprocessing (fit once, used by both conditions B and C)
+        prep = Preprocessor(n_components=n_qubits)
+        X_train_pre = prep.fit_transform(X_train_cnn)
+        X_test_pre  = prep.transform(X_test_cnn)
+ 
+        # ---- Condition B: Classical control (PCA only) ----
+        clf_pca = LogisticRegression(max_iter=2000)
+        clf_pca.fit(X_train_pre, y_train)
+        results.append(evaluate(
+            f"Classical control (PCA-{n_qubits})",
+            clf_pca, X_test_pre, y_test
+        ))
+ 
+        # ---- Condition C: Quantum feature map ----
+        q_transformer = QuantumFeatureTransformer(n_qubits=n_qubits)
+        print(f"  Transforming train set ({len(X_train_pre)} samples)...")
+        X_train_q = q_transformer.transform(X_train_pre)
+        print(f"  Transforming test set ({len(X_test_pre)} samples)...")
+        X_test_q  = q_transformer.transform(X_test_pre)
+        print(f"  Quantum feature shape: {X_train_q.shape}  "
+              f"(Z expectations + ZZ correlators)")
+ 
+        clf_q = LogisticRegression(max_iter=2000)
+        clf_q.fit(X_train_q, y_train)
+        results.append(evaluate(
+            f"Quantum feature map (n_qubits={n_qubits})",
+            clf_q, X_test_q, y_test
+        ))
+ 
+        # Cross-validation on quantum features (train set only)
+        cv_scores = cross_val_score(
+            LogisticRegression(max_iter=2000),
+            X_train_q, y_train, cv=5, scoring="roc_auc"
+        )
+        print(f"  5-fold CV AUC (quantum, n={n_qubits}): "
+              f"{cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+ 
+    # ---- Summary table ----
+    print("\n\n" + "="*60)
+    print("  RESULTS SUMMARY")
+    print("="*60)
+    print(f"  {'Condition':<40} {'Acc':>6} {'F1':>6} {'AUC':>6}")
+    print(f"  {'-'*40} {'-'*6} {'-'*6} {'-'*6}")
+    for r in results:
+        print(f"  {r['name']:<40} {r['accuracy']:>6.4f} {r['f1']:>6.4f} {r['auc']:>6.4f}")
+    print("="*60)
+ 
+ 
+if __name__ == "__main__":
+    main()
