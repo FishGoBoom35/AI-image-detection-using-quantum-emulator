@@ -1,3 +1,10 @@
+##########################################################################
+# CSC 320 Research Project - Hogs 2.0
+# Team: Sean Bender, Michael Beehler, Adam Stafford, Anthony Soria
+# Description: This program was made with the purpose of exploring our
+# research on the usefulness of Quantum computing principles for detecting
+# if an image is real or AI generated
+##########################################################################
 import os
 import pickle
 import numpy as np
